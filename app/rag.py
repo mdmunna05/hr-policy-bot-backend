@@ -30,7 +30,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TOP_K = int(os.getenv("TOP_K", "3"))
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.15"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))
 
 # ── Supported languages ─────────────────────────────────────────────────────
 LANGUAGES = {
