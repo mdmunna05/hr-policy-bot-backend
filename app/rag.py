@@ -138,11 +138,11 @@ def _retrieve(query: str, company: str, top_k: int = TOP_K) -> list[str]:
 
 def answer_query(company: str, query: str, language: str = "English") -> dict:
     """
-    End-to-end RAG pipeline with multilingual support:
+    Hybrid RAG pipeline with multilingual support:
     1. Translate query to English (if needed)
-    2. Retrieve relevant chunks from the company's FAISS index
-    3. Build a safe system prompt with context
-    4. Send to Groq LLM (system + user messages)
+    2. Try to retrieve relevant chunks from the company's FAISS index
+    3. If policy chunks found → answer from context (RAG mode)
+    4. If no relevant chunks → answer using LLM general knowledge (open mode)
     5. Translate answer back to requested language
     6. Return answer with sources
     """
@@ -155,20 +155,13 @@ def answer_query(company: str, query: str, language: str = "English") -> dict:
     # ── Retrieve ─────────────────────────────────────────────────────────
     chunks = _retrieve(query_en, company)
 
-    if not chunks:
-        no_result = "No relevant policy information found for this query."
-        return {
-            "company": company,
-            "query": query,
-            "answer": _translate(no_result, lang_code),
-            "sources": [],
-            "language": language,
-        }
+    client = _get_groq_client()
 
-    # ── Build context ────────────────────────────────────────────────────
-    context = "\n\n".join(chunks)
+    if chunks:
+        # ── RAG MODE: Answer from policy context ────────────────────────
+        context = "\n\n".join(chunks)
 
-    system_prompt = f"""You are the official HR Policy Assistant for {company.title()}.
+        system_prompt = f"""You are the official HR Policy Assistant for {company.title()}.
 
 Your role is to explain HR policies, onboarding processes, leave policies,
 attendance rules, benefits, compliance, and workplace conduct.
@@ -180,7 +173,7 @@ STRICT RULES:
 - You cannot modify employee records.
 - You cannot invent policies.
 - You must answer ONLY using the context below.
-- If information is not available, say:
+- If information is not available in the context, say:
   "This information is not available in the provided company policy."
 
 STYLE:
@@ -195,10 +188,27 @@ Company: {company.title()}
 Context:
 {context}
 """
+        user_message = f"Question: {query_en}"
+
+    else:
+        # ── OPEN MODE: Answer using general knowledge ───────────────────
+        system_prompt = f"""You are a smart, helpful assistant working inside an HR Policy Bot for {company.title()}.
+
+You can answer general questions on any topic — coding, math, science, history,
+technology, career advice, interview tips, general HR concepts, etc.
+
+RULES:
+- Be helpful and accurate.
+- If the question is about a specific {company.title()} internal policy that you
+  don't have data for, say: "I don't have specific {company.title()} policy data
+  for this, but here's some general information."
+- Keep a professional, friendly tone.
+- Use bullet points and clear structure.
+"""
+        user_message = query_en
+        chunks = []
 
     # ── Generate ─────────────────────────────────────────────────────────
-    client = _get_groq_client()
-
     chat = client.chat.completions.create(
         model=GROQ_MODEL,
         temperature=0.2,
@@ -206,7 +216,7 @@ Context:
         max_tokens=500,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Question: {query_en}"},
+            {"role": "user", "content": user_message},
         ],
     )
 
