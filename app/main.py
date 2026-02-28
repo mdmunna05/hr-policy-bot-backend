@@ -8,7 +8,6 @@ Endpoints:
   GET  /health       — Health check
 """
 
-import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,14 +15,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.rag import ask
+from app.rag import answer_query, list_companies
 from app.indexing import build_indexes
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="HR Policy Bot API",
     description="Retrieval-Augmented Generation backend for company HR policies",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # Allow frontend origins (adjust in production)
@@ -35,16 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-INDEX_DIR = os.path.join(os.path.dirname(__file__), "..", "faiss_indexes")
-
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
-class AskRequest(BaseModel):
+class QueryRequest(BaseModel):
     company: str
     query: str
 
 
-class AskResponse(BaseModel):
+class QueryResponse(BaseModel):
     company: str
     query: str
     answer: str
@@ -58,17 +55,9 @@ def health():
 
 
 @app.get("/companies")
-def list_companies():
+def get_companies():
     """Return the list of companies that have a FAISS index available."""
-    if not os.path.isdir(INDEX_DIR):
-        return {"companies": []}
-
-    companies = sorted(
-        f.replace(".index", "")
-        for f in os.listdir(INDEX_DIR)
-        if f.endswith(".index")
-    )
-    return {"companies": companies}
+    return {"companies": list_companies()}
 
 
 @app.post("/index")
@@ -81,16 +70,22 @@ def run_indexing():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask_question(req: AskRequest):
+@app.post("/ask", response_model=QueryResponse)
+def ask(request: QueryRequest):
     """
-    Accept a company name + question, retrieve context from FAISS,
-    and return the Groq-generated answer.
+    Validate company, retrieve context from FAISS,
+    send to Groq LLM, and return the answer.
     """
+    company = request.company.lower().strip()
+
+    if company not in list_companies():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Company '{company}' not found. Available: {list_companies()}",
+        )
+
     try:
-        result = ask(company=req.company, query=req.query)
+        result = answer_query(company, request.query)
         return result
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

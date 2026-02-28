@@ -1,8 +1,15 @@
 """
-rag.py — Retrieval-Augmented Generation query engine
+rag.py — Production-grade Retrieval-Augmented Generation engine
 
 Loads a company-specific FAISS index, retrieves the top-k most relevant
 chunks for a query, then sends them to Groq LLM for answer generation.
+
+Guardrails:
+  - Company isolation (separate FAISS indexes)
+  - No cross-company contamination
+  - Strict informational mode (no approvals / payroll / exceptions)
+  - Similarity threshold to prevent irrelevant retrieval
+  - Structured output format
 """
 
 import os
@@ -21,6 +28,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TOP_K = int(os.getenv("TOP_K", "3"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.15"))
 
 # ── Singletons (loaded once, reused across requests) ────────────────────────
 _embed_model: SentenceTransformer | None = None
@@ -39,6 +47,18 @@ def _get_groq_client() -> Groq:
     if _groq_client is None:
         _groq_client = Groq(api_key=GROQ_API_KEY)
     return _groq_client
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def list_companies() -> list[str]:
+    """Return sorted list of companies that have a FAISS index on disk."""
+    if not os.path.isdir(INDEX_DIR):
+        return []
+    return sorted(
+        f.replace(".index", "")
+        for f in os.listdir(INDEX_DIR)
+        if f.endswith(".index")
+    )
 
 
 # ── Core functions ───────────────────────────────────────────────────────────
@@ -63,7 +83,10 @@ def _load_index(company: str):
 
 
 def _retrieve(query: str, company: str, top_k: int = TOP_K) -> list[str]:
-    """Return the top-k most relevant text chunks for the query."""
+    """
+    Return the top-k most relevant text chunks for the query.
+    Filters out results below SIMILARITY_THRESHOLD.
+    """
     model = _get_embed_model()
     index, chunks = _load_index(company)
 
@@ -74,55 +97,80 @@ def _retrieve(query: str, company: str, top_k: int = TOP_K) -> list[str]:
     scores, indices = index.search(query_vec, top_k)
 
     results = []
-    for idx in indices[0]:
-        if 0 <= idx < len(chunks):
+    for score, idx in zip(scores[0], indices[0]):
+        if 0 <= idx < len(chunks) and score >= SIMILARITY_THRESHOLD:
             results.append(chunks[idx])
     return results
 
 
-def _build_prompt(query: str, context_chunks: list[str], company: str) -> str:
-    """Construct the system + user prompt for the LLM."""
-    context = "\n\n---\n\n".join(context_chunks)
-    return (
-        f"You are an expert HR assistant for {company.title()}.\n"
-        f"Use ONLY the following HR policy excerpts to answer the question.\n"
-        f"If the answer is not in the excerpts, say 'I don't have enough information "
-        f"from the {company.title()} HR policy to answer that.'\n\n"
-        f"### HR Policy Excerpts\n{context}\n\n"
-        f"### Question\n{query}"
-    )
-
-
-def ask(company: str, query: str) -> dict:
+def answer_query(company: str, query: str) -> dict:
     """
     End-to-end RAG pipeline:
     1. Retrieve relevant chunks from the company's FAISS index
-    2. Send chunks + query to Groq LLM
-    3. Return the answer
+    2. Build a safe, structured system prompt
+    3. Send context + query to Groq LLM
+    4. Return answer with sources
     """
-    # Retrieve
+    company = company.lower().strip()
+
+    # ── Retrieve ─────────────────────────────────────────────────────────
     chunks = _retrieve(query, company)
 
     if not chunks:
         return {
             "company": company,
             "query": query,
-            "answer": f"No relevant information found in {company.title()}'s HR policy.",
+            "answer": "No relevant policy information found for this query.",
             "sources": [],
         }
 
-    # Generate
-    prompt = _build_prompt(query, chunks, company)
+    # ── Build context ────────────────────────────────────────────────────
+    context = "\n\n".join(chunks)
+
+    system_prompt = f"""You are a professional HR onboarding and policy explanation assistant.
+
+STRICT RULES:
+- Only explain policies from the provided context.
+- Do NOT approve leave.
+- Do NOT modify payroll.
+- Do NOT give policy exceptions.
+- You must answer ONLY using the context below.
+- If context is insufficient, say:
+  "This information is not available in the provided company policy."
+
+Response Format:
+
+### Policy Overview
+...
+
+### Key Rules
+- ...
+- ...
+
+### Important Notes
+...
+
+Answer in a structured format with clear headings, bullet points where applicable,
+simple explanations, professional tone, and no assumptions.
+
+Company: {company.title()}
+
+Context:
+{context}
+"""
+
+    # ── Generate ─────────────────────────────────────────────────────────
     client = _get_groq_client()
 
     chat = client.chat.completions.create(
         model=GROQ_MODEL,
+        temperature=0.2,
+        top_p=0.9,
+        max_tokens=600,
         messages=[
-            {"role": "system", "content": "You are a helpful HR policy assistant."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query},
         ],
-        temperature=0.3,
-        max_tokens=1024,
     )
 
     answer = chat.choices[0].message.content
