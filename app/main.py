@@ -15,14 +15,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.rag import answer_query, list_companies
+from app.rag import answer_query, list_companies, list_languages
 from app.indexing import build_indexes
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="HR Policy Bot API",
     description="Retrieval-Augmented Generation backend for company HR policies",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 # Allow frontend origins (adjust in production)
@@ -39,6 +39,7 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     company: str
     query: str
+    language: str = "English"
 
 
 class QueryResponse(BaseModel):
@@ -46,6 +47,7 @@ class QueryResponse(BaseModel):
     query: str
     answer: str
     sources: list[str]
+    language: str
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -58,6 +60,12 @@ def health():
 def get_companies():
     """Return the list of companies that have a FAISS index available."""
     return {"companies": list_companies()}
+
+
+@app.get("/languages")
+def get_languages():
+    """Return the list of supported languages."""
+    return {"languages": list_languages()}
 
 
 @app.post("/index")
@@ -75,6 +83,7 @@ def ask(request: QueryRequest):
     """
     Validate company, retrieve context from FAISS,
     send to Groq LLM, and return the answer.
+    Supports multilingual queries via optional 'language' field.
     """
     company = request.company.lower().strip()
 
@@ -85,7 +94,7 @@ def ask(request: QueryRequest):
         )
 
     try:
-        result = answer_query(company, request.query)
+        result = answer_query(company, request.query, request.language)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -4,12 +4,13 @@ rag.py — Production-grade Retrieval-Augmented Generation engine
 Loads a company-specific FAISS index, retrieves the top-k most relevant
 chunks for a query, then sends them to Groq LLM for answer generation.
 
-Guardrails:
+Features:
   - Company isolation (separate FAISS indexes)
   - No cross-company contamination
   - Strict informational mode (no approvals / payroll / exceptions)
-  - Similarity threshold to prevent irrelevant retrieval
-  - Structured output format
+  - Cosine similarity with threshold to prevent irrelevant retrieval
+  - Multilingual support (10 languages)
+  - Structured system + user message design
 """
 
 import os
@@ -18,6 +19,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from groq import Groq
+from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,6 +31,20 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TOP_K = int(os.getenv("TOP_K", "3"))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.15"))
+
+# ── Supported languages ─────────────────────────────────────────────────────
+LANGUAGES = {
+    "English": "en",
+    "Hindi": "hi",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Chinese": "zh-CN",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Tamil": "ta",
+    "Telugu": "te",
+}
 
 # ── Singletons (loaded once, reused across requests) ────────────────────────
 _embed_model: SentenceTransformer | None = None
@@ -49,6 +65,17 @@ def _get_groq_client() -> Groq:
     return _groq_client
 
 
+# ── Translation helpers ──────────────────────────────────────────────────────
+def _translate(text: str, target_lang: str) -> str:
+    """Translate text to target language. Returns original on failure."""
+    if target_lang == "en":
+        return text
+    try:
+        return GoogleTranslator(source="auto", target=target_lang).translate(text)
+    except Exception:
+        return text
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def list_companies() -> list[str]:
     """Return sorted list of companies that have a FAISS index on disk."""
@@ -59,6 +86,11 @@ def list_companies() -> list[str]:
         for f in os.listdir(INDEX_DIR)
         if f.endswith(".index")
     )
+
+
+def list_languages() -> list[str]:
+    """Return list of supported language names."""
+    return list(LANGUAGES.keys())
 
 
 # ── Core functions ───────────────────────────────────────────────────────────
@@ -85,6 +117,7 @@ def _load_index(company: str):
 def _retrieve(query: str, company: str, top_k: int = TOP_K) -> list[str]:
     """
     Return the top-k most relevant text chunks for the query.
+    Uses cosine similarity (IndexFlatIP on normalized vectors).
     Filters out results below SIMILARITY_THRESHOLD.
     """
     model = _get_embed_model()
@@ -103,55 +136,59 @@ def _retrieve(query: str, company: str, top_k: int = TOP_K) -> list[str]:
     return results
 
 
-def answer_query(company: str, query: str) -> dict:
+def answer_query(company: str, query: str, language: str = "English") -> dict:
     """
-    End-to-end RAG pipeline:
-    1. Retrieve relevant chunks from the company's FAISS index
-    2. Build a safe, structured system prompt
-    3. Send context + query to Groq LLM
-    4. Return answer with sources
+    End-to-end RAG pipeline with multilingual support:
+    1. Translate query to English (if needed)
+    2. Retrieve relevant chunks from the company's FAISS index
+    3. Build a safe system prompt with context
+    4. Send to Groq LLM (system + user messages)
+    5. Translate answer back to requested language
+    6. Return answer with sources
     """
     company = company.lower().strip()
+    lang_code = LANGUAGES.get(language, "en")
+
+    # ── Translate query to English for embedding ─────────────────────────
+    query_en = _translate(query, "en") if lang_code != "en" else query
 
     # ── Retrieve ─────────────────────────────────────────────────────────
-    chunks = _retrieve(query, company)
+    chunks = _retrieve(query_en, company)
 
     if not chunks:
+        no_result = "No relevant policy information found for this query."
         return {
             "company": company,
             "query": query,
-            "answer": "No relevant policy information found for this query.",
+            "answer": _translate(no_result, lang_code),
             "sources": [],
+            "language": language,
         }
 
     # ── Build context ────────────────────────────────────────────────────
     context = "\n\n".join(chunks)
 
-    system_prompt = f"""You are a professional HR onboarding and policy explanation assistant.
+    system_prompt = f"""You are the official HR Policy Assistant for {company.title()}.
+
+Your role is to explain HR policies, onboarding processes, leave policies,
+attendance rules, benefits, compliance, and workplace conduct.
 
 STRICT RULES:
-- Only explain policies from the provided context.
-- Do NOT approve leave.
-- Do NOT modify payroll.
-- Do NOT give policy exceptions.
+- You provide information only.
+- You cannot approve leave.
+- You cannot process payroll.
+- You cannot modify employee records.
+- You cannot invent policies.
 - You must answer ONLY using the context below.
-- If context is insufficient, say:
+- If information is not available, say:
   "This information is not available in the provided company policy."
 
-Response Format:
-
-### Policy Overview
-...
-
-### Key Rules
-- ...
-- ...
-
-### Important Notes
-...
-
-Answer in a structured format with clear headings, bullet points where applicable,
-simple explanations, professional tone, and no assumptions.
+STYLE:
+- Clear, friendly, professional tone.
+- Start with a direct answer.
+- Use bullet points where applicable.
+- Keep responses concise and structured.
+- No assumptions beyond the provided context.
 
 Company: {company.title()}
 
@@ -166,18 +203,23 @@ Context:
         model=GROQ_MODEL,
         temperature=0.2,
         top_p=0.9,
-        max_tokens=600,
+        max_tokens=500,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query},
+            {"role": "user", "content": f"Question: {query_en}"},
         ],
     )
 
     answer = chat.choices[0].message.content
+
+    # ── Translate answer if needed ───────────────────────────────────────
+    if lang_code != "en":
+        answer = _translate(answer, lang_code)
 
     return {
         "company": company,
         "query": query,
         "answer": answer,
         "sources": chunks,
+        "language": language,
     }
