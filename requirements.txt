@@ -1,0 +1,7 @@
+faiss-cpu
+sentence-transformers
+fastapi
+uvicorn
+boto3
+groq
+python-dotenv
